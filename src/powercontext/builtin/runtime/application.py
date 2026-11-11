@@ -2432,7 +2432,13 @@ class ScopedMemoryApplication:
                 ),
             )
 
-    async def search(self, request: SearchMemoryRequest, /) -> MemorySearchPage:
+    async def search(
+        self,
+        request: SearchMemoryRequest,
+        /,
+        *,
+        admission: AdmissionFloor | None = None,
+    ) -> MemorySearchPage:
         async with self._runtime._context(
             self.scope_id,
             generation_purpose=ModelUsagePurpose.MEMORY_RECALL,
@@ -2463,6 +2469,7 @@ class ScopedMemoryApplication:
                             limit=request.limit,
                             mode=request.mode,
                             tag_filter=request.tag_filter,
+                            **_admission_keyword(admission),
                         )
                     except (CapabilityNotSupportedError, InvalidMemoryCitationError) as error:
                         latest = await _head_or_none(service, context.artifacts.memory_artifact_id)
