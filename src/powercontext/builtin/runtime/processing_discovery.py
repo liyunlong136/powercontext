@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bounded reconciliation of Source-driven Family progress at startup."""
+"""Bounded reconciliation and admission of Source-driven Family progress."""
 
 from __future__ import annotations
 
@@ -74,3 +74,61 @@ class SourceProcessingPendingProvider:
                 if intent is None or intent.dirty_generation == intent.clean_generation:
                     await intents.mark_dirty(connection, scope, self._binding)
         return str(rows[-1][0]) if len(rows) == limit else None
+
+
+class SourceCountAdmission:
+    """Accept one Scope whose pending Source count reached a configured threshold.
+
+    The count is the number of persisted journal entries behind the family's last
+    committed Source cursor. It follows the journal identity, so a replayed capture
+    and a receipt trust upgrade keep their original position and never add to it. A
+    lineage-only Source still occupies a journal entry and therefore counts, while the
+    Family's own rules keep excluding it from generation evidence.
+    """
+
+    def __init__(self, database: AsyncDatabase, binding_name: str, threshold: int) -> None:
+        if type(threshold) is not int or threshold < 1:
+            raise ValueError("threshold must be a positive integer")  # noqa: TRY003
+        self._database = database
+        self._binding = binding_name
+        self._threshold = threshold
+
+    async def admit(
+        self, after_scope_id: str | None, limit: int, *, fence: ArtifactProcessingFence
+    ) -> tuple[str | None, bool]:
+        """Accept every eligible Scope in one bounded page.
+
+        Returns the next keyset position, or None when this pass is complete, and
+        whether at least one invocation was accepted.
+        """
+
+        heads = SOURCE_JOURNAL_HEADS_TABLE
+        statement = select(heads.c.scope_id, heads.c.position).order_by(heads.c.scope_id).limit(limit)
+        if after_scope_id is not None:
+            statement = statement.where(heads.c.scope_id > after_scope_id)
+        async with self._database.transaction() as connection:
+            await ArtifactProcessingLeaseRepository().require_fence(connection, fence)
+            rows = (await connection.execute(statement)).all()
+            if not rows:
+                return None, False
+            scope_ids = tuple(str(row[0]) for row in rows)
+            cursors = await SourceCursorRepository().load_many(connection, scope_ids, self._binding)
+            intents = ArtifactProcessingIntentRepository()
+            accepted = False
+            for scope, high in rows:
+                scope_id = str(scope)
+                cursor = cursors.get(scope_id)
+                position = 0 if cursor is None else cursor.cursor.sequence
+                if int(high) - position < self._threshold:
+                    continue
+                intent = await intents.load(connection, scope_id, self._binding, for_update=True)
+                # An accepted but unhandled invocation already owns this Scope. The
+                # threshold never discards it, and never accepts a second one.
+                if intent is not None and intent.requested_generation > intent.handled_generation:
+                    continue
+                await intents.request(connection, scope_id, self._binding)
+                accepted = True
+        return (str(rows[-1][0]) if len(rows) == limit else None), accepted
+
+
+__all__ = ["SourceCountAdmission", "SourceProcessingPendingProvider", "enabled_profile_scopes"]

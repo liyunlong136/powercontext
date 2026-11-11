@@ -67,6 +67,7 @@ from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkerOutcome,
     WorkerEntrypoint,
 )
+from powercontext.builtin.runtime.processing_discovery import SourceCountAdmission
 from powercontext.builtin.runtime.protocols import RuntimeTracing
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,11 @@ _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
 _DISCOVERY_TIMEOUT_SECONDS = 2.0
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+# The count trigger observes journal metadata, so it polls instead of waiting for a
+# Source event. The interval only bounds how long a busy Scope waits for admission.
+_COUNT_TRIGGER_POLL_SECONDS = 1.0
+# Schedule checkpoints stay naive UTC, so their upper bound is naive as well.
+_MAX_NAIVE_DATETIME = datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=UTC).replace(tzinfo=None)
 ProcessingKey = tuple[str, str]
 
 
@@ -117,6 +123,9 @@ class ArtifactProcessingBinding:
     # Only automatic admission is filtered; already accepted requests retain
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
+    # A positive count admits automatic processing once that many new Source entries
+    # wait behind this Family's committed cursor. None keeps the count trigger closed.
+    source_count_threshold: int | None = None
 
     def __post_init__(self) -> None:
         if not self.binding_name or self.binding_name != self.binding_name.strip():
@@ -129,6 +138,7 @@ class ArtifactProcessingBinding:
         object.__setattr__(self, "config_prefix", prefix)
         if type(self.max_workers) is not int or self.max_workers < 1:
             raise ValueError("max_workers must be a positive integer")  # noqa: TRY003
+        _require_positive_count(self.source_count_threshold)
         if self.worker_timeout_seconds <= 0:
             raise ValueError("worker_timeout_seconds must be positive")  # noqa: TRY003
         if self.automatic_processing_interval is not None:
@@ -138,6 +148,13 @@ class ArtifactProcessingBinding:
                 raise ValueError("interval and cron cannot both be enabled")  # noqa: TRY003
         if self.cron is not None:
             CronTrigger.from_crontab(self.cron, timezone=ZoneInfo(self.timezone))
+
+
+def _require_positive_count(value: int | None) -> None:
+    """Accept a closed count trigger or one strict positive count."""
+
+    if value is not None and (type(value) is not int or value < 1):
+        raise ValueError("source_count_threshold must be a positive integer")  # noqa: TRY003
 
 
 class _WorkerResultSender(Protocol):
@@ -396,6 +413,7 @@ class _FamilyState:
     scan_generation: int = 0
     scan_in_progress: bool = False
     reconcile_after: str | None = None
+    count_after: str | None = None
     reconcile_complete: bool = False
     notification_at_start: int = 0
     discovery_pending: bool = True
@@ -585,6 +603,7 @@ class ArtifactProcessingSupervisor:
             state.discovery_pending = True
             state.reconcile_complete = False
             state.reconcile_after = None
+            state.count_after = None
         if self._lease_mode == "oceanbase":
             self._renew_task = asyncio.create_task(self._renew(), name=f"artifact-lease-{self._supervisor_group}")
 
@@ -648,6 +667,9 @@ class ArtifactProcessingSupervisor:
                 state.next_discovery_at = loop.time() + _DISCOVERY_PAGE_DELAY_SECONDS
         else:
             state.reconcile_complete = True
+        # The count trigger admits a Scope before the requested scan runs, so the
+        # accepted request is visible to this same discovery pass.
+        await self._discover_count(state)
         # Alternate discovery channels so explicit traffic cannot monopolize admission.
         state.automatic_next = not state.automatic_next
         if state.automatic_next:
@@ -656,6 +678,23 @@ class ArtifactProcessingSupervisor:
         else:
             await self._discover_requested(state)
             await self._discover_automatic(state)
+
+    async def _discover_count(self, state: _FamilyState) -> None:
+        """Accept the Scopes whose pending Source count reached the threshold."""
+
+        binding = state.binding
+        threshold = binding.source_count_threshold
+        if threshold is None:
+            return
+        admission = SourceCountAdmission(self._database, binding.binding_name, threshold)
+        after, accepted = await admission.admit(
+            state.count_after, _DISCOVERY_PAGE_SIZE, fence=self._require_current_fence()
+        )
+        state.count_after = after
+        if accepted:
+            # The accepted request must be visible to the next requested scan.
+            state.requested_after = 0
+            state.discovery_pending = True
 
     async def _discover_requested(self, state: _FamilyState) -> None:
         capacity = self._fresh_capacity(state)
@@ -1059,6 +1098,7 @@ class ArtifactProcessingSupervisor:
             state.retries.clear()
             state.requested_after = state.scan_after = state.scan_generation = 0
             state.scan_in_progress = False
+            state.count_after = None
             state.discovery_pending = True
 
     async def _reap_unconfirmed_exits(self) -> None:
@@ -1093,6 +1133,10 @@ class ArtifactProcessingSupervisor:
                 continue
             if state.next_schedule_at is not None:
                 deadlines.append(state.next_schedule_at)
+            if state.binding.source_count_threshold is not None:
+                # A count-enabled Family keeps observing journal metadata, because a
+                # new Source entry does not notify the Supervisor by itself.
+                deadlines.append(now + _COUNT_TRIGGER_POLL_SECONDS)
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
                 deadlines.append(max(now, state.next_discovery_at))
         return None if not deadlines else max(0.001, min(deadlines) - now)
@@ -1147,7 +1191,7 @@ def _schedule_deadline(
     trigger = CronTrigger.from_crontab(binding.cron, timezone=ZoneInfo(binding.timezone))
     first = trigger.get_next_fire_time(None, (checkpoint + timedelta(microseconds=1)).replace(tzinfo=UTC))
     if first is None:
-        return None, datetime.max.replace(tzinfo=None)
+        return None, _MAX_NAIVE_DATETIME
     first = first.astimezone(UTC).replace(tzinfo=None)
     if first > now:
         return None, first
@@ -1164,7 +1208,7 @@ def _schedule_deadline(
         else:
             hi = mid
     following = trigger.get_next_fire_time(None, (latest + timedelta(microseconds=1)).replace(tzinfo=UTC))
-    return latest, datetime.max.replace(tzinfo=None) if following is None else following.astimezone(UTC).replace(
+    return latest, _MAX_NAIVE_DATETIME if following is None else following.astimezone(UTC).replace(
         tzinfo=None
     )
 
