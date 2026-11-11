@@ -186,6 +186,46 @@ SOURCE_JOURNAL_HEADS_TABLE = Table(
     CheckConstraint("position >= 0", name="ck_pc_source_journal_heads_position_nonnegative"),
 )
 
+SOURCE_LIFECYCLE_NODES_TABLE = Table(
+    "pc_source_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_ID_LENGTH), primary_key=True),
+    Column("kind", identity_string(16), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("reference", _canonical_payload_type(), nullable=False),
+    Column("parents", _canonical_payload_type(), nullable=False),
+    Column("policy", identity_string(8)),
+    Column("revision", Integer),
+    Column("sequence", BigInteger, nullable=False, server_default="0"),
+    Column("available", Boolean, nullable=False),
+    Column("event_reason", _entry_text_type()),
+    CheckConstraint(
+        "kind IN ('source', 'memory', 'topic')",
+        name="ck_pc_source_lifecycle_nodes_kind",
+    ),
+    CheckConstraint(
+        "ordinal >= 0",
+        name="ck_pc_source_lifecycle_nodes_ordinal_nonnegative",
+    ),
+    CheckConstraint(
+        "policy IS NULL OR policy IN ('all', 'any')",
+        name="ck_pc_source_lifecycle_nodes_policy",
+    ),
+    CheckConstraint(
+        "revision IS NULL OR revision > 0",
+        name="ck_pc_source_lifecycle_nodes_revision_positive",
+    ),
+    CheckConstraint(
+        "sequence >= 0",
+        name="ck_pc_source_lifecycle_nodes_sequence_nonnegative",
+    ),
+)
+
+# The Source lifecycle graph is created with the rest of the built-in schema but
+# is not part of the documented restore set, so it stays out of BUILTIN_TABLES.
+SOURCE_LIFECYCLE_TABLES = (SOURCE_LIFECYCLE_NODES_TABLE,)
+
 ARTIFACTS_TABLE = Table(
     "pc_artifacts",
     SHARED_METADATA,
