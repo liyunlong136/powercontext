@@ -28,6 +28,13 @@ from powercontext.builtin.artifacts.memory.models import MemoryCitation, MemoryH
 from powercontext.builtin.artifacts.profile.models import Profile
 from powercontext.builtin.artifacts.topic_memory import TopicMemory, TopicMemorySearchHit
 from powercontext.builtin.runtime.errors import PreparedContextInvariantError
+from powercontext.builtin.runtime.evidence_selection import (
+    EvidenceEntry,
+    PreparedEvidenceFragment,
+    build_entries,
+    rank_candidates,
+    score_sentences,
+)
 from powercontext.builtin.runtime.models import PrepareContextRequest, PreparedContext
 from powercontext.builtin.runtime.prepared_code import (
     CodeEvidenceRef,
@@ -106,6 +113,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedEvidenceFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -211,6 +219,17 @@ class PreparedContextBuilder:
         profile_candidates: Sequence[PreparedProfileCandidate] = (),
         code_candidates: Sequence[PreparedCodeCandidate] = (),
     ) -> PreparedContextBuild:
+        if request.evidence_selection:
+            # Evidence selection is its own delivery mode: it works on the
+            # recalled Memory entries only and renders literal fragments with
+            # their own citation shape, so it does not share the item renderer
+            # used by the ordinary prepare path.
+            return self._build_evidence_result(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+
         if request.include_code:
 
             def historical(history_request: PrepareContextRequest, entries: int) -> PreparedContextBuild:
@@ -346,6 +365,116 @@ class PreparedContextBuilder:
         if not entries:
             return None, (), omissions
         return _render(entries), tuple(entry.origin for entry in entries), omissions
+
+    def _build_evidence_result(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select literal evidence fragments for the request query.
+
+        The candidate set is what retrieval already returned; this pass only
+        decides which parts of those entries survive the caller's byte budget.
+        Every fragment is a verbatim ``entry.text[start:end]`` slice and keeps
+        the exact citation of the entry version it came from, so a caller can
+        resolve any fragment back to the original entry.
+        """
+
+        groups = [
+            (candidates.scope_id or current_scope_id or "", candidates.hits)
+            for candidates in memory_candidates
+        ]
+        entries = build_entries(groups)
+        if not entries:
+            return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
+        ranked = rank_candidates(score_sentences(request.query, entries))
+        if not ranked:
+            return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
+
+        chosen: list[tuple[EvidenceEntry, int, int]] = []
+        for candidate in ranked:
+            entry = entries[candidate.entry_index]
+            trial = [*chosen, (entry, candidate.start, candidate.end)]
+            _, _, trial_content = self._render_evidence(trial, entries)
+            if trial_content is None:
+                continue
+            if len(trial_content.encode("utf-8")) > request.max_bytes:
+                continue
+            chosen = trial
+        if not chosen:
+            return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
+
+        fragments, origins, content = self._render_evidence(chosen, entries)
+        if content is None:
+            return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > request.max_bytes:
+            raise PreparedContextInvariantError("output-budget")
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+            origins=origins,
+            fragments=fragments,
+        )
+
+    def _render_evidence(
+        self,
+        chosen: Sequence[tuple[EvidenceEntry, int, int]],
+        entries: Sequence[EvidenceEntry],
+    ) -> tuple[
+        tuple[PreparedEvidenceFragment, ...],
+        tuple[PreparedContextOrigin, ...],
+        str | None,
+    ]:
+        """Merge the chosen sentences per entry and render the evidence context.
+
+        Chosen sentences that are adjacent inside the same entry are merged into
+        one fragment: the merged range is still a verbatim slice, and one
+        citation instead of two leaves more of the budget for evidence.
+        """
+
+        del entries
+        by_entry: dict[int, list[tuple[int, int]]] = {}
+        entry_by_index: dict[int, EvidenceEntry] = {}
+        for entry, start, end in chosen:
+            by_entry.setdefault(entry.index, []).append((start, end))
+            entry_by_index[entry.index] = entry
+
+        fragments: list[PreparedEvidenceFragment] = []
+        origins: list[PreparedContextOrigin] = []
+        items: list[dict[str, object]] = []
+        for entry_index in sorted(by_entry):
+            entry = entry_by_index[entry_index]
+            merged = _merge_whitespace_gap(by_entry[entry_index], entry.hit.text)
+            for start, end in merged:
+                text = entry.hit.text[start:end]
+                address = MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=entry.scope_id, artifact=entry.hit.memory_ref),
+                    entry_id=entry.hit.entry_id,
+                    entry_version_id=entry.hit.entry_version_id,
+                )
+                fragments.append(PreparedEvidenceFragment(address=address, start=start, end=end, text=text))
+                origins.append(address)
+                items.append(
+                    {
+                        "citation": {
+                            "scope_id": entry.scope_id,
+                            "memory_ref": entry.hit.memory_ref.model_dump(mode="json"),
+                            "entry_id": entry.hit.entry_id,
+                            "entry_version_id": entry.hit.entry_version_id,
+                        },
+                        "content": text,
+                        "start": start,
+                        "end": end,
+                    }
+                )
+        if not fragments:
+            return (), (), None
+        envelope = {"trust": "untrusted_history", "items": items}
+        encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+        content = "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+        return tuple(fragments), tuple(origins), content
 
     def _select_text(
         self,
@@ -658,6 +787,31 @@ class PreparedContextBuilder:
         if best is None:
             return _EntryFit(dropped_no_fitting_truncation=True)
         return _EntryFit(entry=best)
+
+
+def _merge_whitespace_gap(ranges: Sequence[tuple[int, int]], text: str) -> list[tuple[int, int]]:
+    """Merge ranges that overlap or are separated by whitespace only.
+
+    Two sentences of the same entry that sit next to each other become one
+    fragment, which keeps the citation overhead down.  A range separated from
+    the next one by real content stays separate, so no fragment ever claims
+    text it does not contain.
+    """
+
+    if not ranges:
+        return []
+    ordered = sorted(ranges)
+    merged = [ordered[0]]
+    for start, end in ordered[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+            continue
+        if not text[last_end:start].strip():
+            merged[-1] = (last_start, end)
+            continue
+        merged.append((start, end))
+    return merged
 
 
 def _interleave(
