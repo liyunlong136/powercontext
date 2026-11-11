@@ -39,6 +39,11 @@ from powercontext.builtin.artifacts.memory.extraction import (
     MemoryExtractionIntent,
     MemoryExtractionOutput,
 )
+from powercontext.builtin.artifacts.memory.http_reranker import (
+    HTTP_RERANKER_BATCH_SIZE,
+    HTTP_RERANKER_POLICY_ID,
+    HTTPMemoryReranker,
+)
 from powercontext.builtin.artifacts.memory.models import (
     EmbeddingProfile,
     Memory,
@@ -108,6 +113,8 @@ from powercontext.builtin.artifacts.memory.service import MemoryRememberMode, Me
 __all__ = [
     "CONVERSATION_MEMORY_EXTRACTION_INSTRUCTIONS",
     "CONVERSATION_MEMORY_EXTRACTION_INSTRUCTIONS_VERSION",
+    "HTTP_RERANKER_BATCH_SIZE",
+    "HTTP_RERANKER_POLICY_ID",
     "MEMORY_EXTRACTION_INSTRUCTIONS",
     "MEMORY_EXTRACTION_INSTRUCTIONS_VERSION",
     "MEMORY_RERANK_INSTRUCTIONS",
@@ -116,6 +123,7 @@ __all__ = [
     "CapabilityNotSupportedError",
     "DefaultMemoryEvidenceProjector",
     "EmbeddingProfile",
+    "HTTPMemoryReranker",
     "InvalidEmbeddingError",
     "InvalidMemoryCandidateError",
     "InvalidMemoryCitationError",
